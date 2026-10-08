@@ -27,6 +27,35 @@ def cell_name(col, row):
     return f"{FILES[col]}{row + 1}"
 
 
+class SpawnAwareController(LiveTargetController):
+    """Same PD control, but position = body spawn + joint offset (world frame),
+    so targets from square_to_xy line up with where the robot really is."""
+
+    def step(self, data, rd):
+        with self.lock:
+            tx, ty = self.target
+        x_id, y_id, yaw_id = rd["pos"]
+        x_ctrl, y_ctrl, yaw_ctrl = rd["ctrl"]
+        x_vel, y_vel, yaw_vel = rd["vel"]
+        sx, sy = rd["spawn"]
+
+        x, y = sx + data.qpos[x_id], sy + data.qpos[y_id]
+        yaw = data.qpos[yaw_id]
+        vx, vy, vyaw = data.qvel[x_vel], data.qvel[y_vel], data.qvel[yaw_vel]
+
+        ex, ey = tx - x, ty - y
+        dist = np.hypot(ex, ey)
+        data.ctrl[x_ctrl] = self.kp * ex - self.kd * vx
+        data.ctrl[y_ctrl] = self.kp * ey - self.kd * vy
+
+        if dist > 0.02:
+            target_yaw = np.arctan2(ey, ex)
+            yaw_err = np.arctan2(np.sin(target_yaw - yaw), np.cos(target_yaw - yaw))
+            data.ctrl[yaw_ctrl] = self.kp_yaw * yaw_err - self.kd_yaw * vyaw
+        else:
+            data.ctrl[yaw_ctrl] = -self.kd_yaw * vyaw
+
+
 def main():
     ckpt = torch.load("policy.pt", map_location="cpu")
     size = ckpt["size"]
@@ -68,8 +97,11 @@ def main():
 
     goals = np.array([[FILES.index(s[0]), int(s[1]) - 1] for s in GOAL_SQUARES])
     cells = [nearest_cell(world_xy(i)) for i in range(n)]
-    ctrl = [LiveTargetController(tuple(world_xy(i))) for i in range(n)]
+    ctrl = [SpawnAwareController(tuple(world_xy(i))) for i in range(n)]
     targets = [tuple(centers[c[1], c[0]]) for c in cells]
+    for i in range(n):                       # drive to the first square center
+        ctrl[i].set_target(targets[i])
+    last_cmd = 0.0
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
@@ -77,7 +109,9 @@ def main():
 
             # Everyone has reached their current square -> ask the CNN for the next move.
             settled = all(np.linalg.norm(world_xy(i) - targets[i]) < SETTLE_TOL for i in range(n))
-            if settled:
+            timed_out = (data.time - last_cmd) > 4.0   # don't stall if a robot stops just short
+            if settled or timed_out:
+                last_cmd = data.time
                 cells = [nearest_cell(world_xy(i)) for i in range(n)]
                 obs = torch.as_tensor(build_obs(np.array(cells), goals, size))
                 with torch.no_grad():
@@ -95,6 +129,8 @@ def main():
                 for i in range(n):
                     targets[i] = tuple(centers[prop[i][1], prop[i][0]])
                     ctrl[i].set_target(targets[i])
+                print("cells", [cell_name(*c) for c in cells],
+                      "actions", acts.tolist(), "-> goals", GOAL_SQUARES)
 
             for i in range(n):
                 ctrl[i].step(data, robot_data[i])
