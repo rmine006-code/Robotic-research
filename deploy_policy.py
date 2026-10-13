@@ -66,7 +66,7 @@ def main():
     model = mujoco.MjModel.from_xml_path("chess_grid.xml")
     data = mujoco.MjData(model)
     names = ["robot1", "robot2"]
-    n = len(names)
+    n = len(names) 
 
     robot_data = []
     for name in names:
